@@ -1,0 +1,300 @@
+---
+title: "pa_phone_sensedoc"
+author: "Daniel Fuller"
+date: "23/02/2021"
+output:
+  html_document: 
+    keep_md: yes
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Required packages
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(naniar)
+library(ggmap)
+library(ggthemes)
+library(sf)
+library(rgeos)
+library(cancensus)
+library(cowplot)
+library(ggspatial)
+library(knitr)
+
+setwd("/Users/dfuller/Dropbox/Projects/INTERACT_github/pa_phone_sensedoc/")
+```
+
+# Physical Activity
+
+https://reader.elsevier.com/reader/sd/pii/S1440244011000788?token=EF8BC1F1D26E1549EB101EBB8B8F90E8A13690C5BBCE4B0E263DE65441B5D61D63D1E3CD243FE9138D314E9E6E13DB28
+
+### Reading in the physical activity data from SenseDoc
+```{r warning=FALSE}
+data_temp <- NULL
+
+data_temp <- dir(path = "/Users/dfuller/Documents/INTERACT/data/sensors/", full.names = TRUE, pattern = "*_sd.csv", recursive = TRUE) %>%
+   purrr::map(function(i){
+     dfhx <- read.csv(i, header = TRUE)
+     temp <- bind_rows(data_temp, dfhx)
+   })
+
+sd_data <- bind_rows(data_temp)
+rm(data_temp)
+table(sd_data$city)
+```
+
+### Reading in the physical activity data from Ethica
+```{r warning=FALSE}
+data_temp <- NULL
+
+data_temp <- dir(path = "/Users/dfuller/Documents/INTERACT/data/sensors/", full.names = TRUE, pattern = "*_ethica.csv", recursive = TRUE) %>%
+   purrr::map(function(i){
+     dfhx <- read.csv(i, header = TRUE)
+     temp <- bind_rows(data_temp, dfhx)
+   })
+
+ethica_data <- bind_rows(data_temp)
+rm(data_temp)
+table(ethica_data$city)
+```
+
+## Some basic cleaning
+
+```{r warning=FALSE}
+sd_data <- sd_data %>% filter(wearing == 1)
+ethica_data <- ethica_data %>% filter(wearing == 1)
+```
+
+## Applying Cut-points from this paper (using 3 axes VM)
+
+https://www.sciencedirect.com/science/article/pii/S1440244011000788
+
+    Light: 0 - 2690 CPM 
+    Moderate: 2691 - 6166 CPM
+    Vigorous: 6167 - 9642 CPM
+    Very Vigorous: 9643 - ∞ CPM
+
+```{r warning=FALSE}
+sd_data <- sd_data %>%
+	mutate(activity_levels_vm3 = case_when(
+		summary_count <= 2690 ~ "light",
+		summary_count >= 2691 & summary_count <= 6166 ~ "moderate",
+	  summary_count >= 6167 ~ "vigorous"
+	))
+
+ethica_data <- ethica_data %>%
+	mutate(activity_levels_vm3 = case_when(
+		summary_count <= 2690 ~ "light",
+		summary_count >= 2691 & summary_count <= 6166 ~ "moderate",
+	  summary_count >= 6167 ~ "vigorous"
+	))
+```
+
+### Troiano cut-points on vertical axis counts
+
+```{r}
+sd_data <- sd_data %>%
+	mutate(activity_levels = case_when(
+		x_count < 100 ~ "sedentary",
+		x_count >= 100 & x_count <= 1951 ~ "light",
+		x_count >= 1951 & x_count <= 5724 ~ "moderate",
+	  x_count >= 5725 ~ "vigorous"
+	))
+
+ethica_data <- ethica_data %>%
+	mutate(activity_levels = case_when(
+		x_count < 100 ~ "sedentary",
+		x_count >= 100 & x_count <= 1951 ~ "light",
+		x_count >= 1951 & x_count <= 5724 ~ "moderate",
+	  x_count >= 5725 ~ "vigorous"
+	))
+```
+
+## Create a date column and add a minutes in census tract by id, date, and census tract column 
+
+```{r}
+#### SenseDoc
+sd_data$date <- sd_data$utcdate %>% as.Date()
+sd_data$minutes <- 1
+
+sd_data <- sd_data %>% 
+  group_by(interact_id, date, city_id) %>% 
+  mutate(
+      minutes_id_date_city = sum(minutes)
+  )
+
+### Ethica
+ethica_data$date <- ethica_data$utcdate %>% as.Date()
+ethica_data$minutes <- 1
+
+ethica_data <- ethica_data %>% 
+  group_by(interact_id, date, city_id) %>% 
+  mutate(
+      minutes_id_date_city = sum(minutes)
+  )
+```
+
+### MPVA Minutes SenseDoc
+
+```{r}
+table(sd_data$activity_levels)
+
+table(sd_data$wearing)
+
+### MVPA Minutes
+sd_data <- sd_data %>%
+	mutate(mvpa_vm3 = case_when(
+		activity_levels_vm3 == "light" ~ 0,
+		activity_levels_vm3 == "moderate" ~ 1,
+		activity_levels_vm3 == "vigorous" ~ 1
+	))
+
+table(sd_data$mvpa_vm3)
+
+### Light Minutes
+sd_data <- sd_data %>%
+	mutate(light_vm3 = case_when(
+		activity_levels_vm3 == "light" ~ 1,
+		activity_levels_vm3 == "moderate" ~ 0,
+		activity_levels_vm3 == "vigorous" ~ 0
+	))
+
+sd_data <- sd_data %>% 
+    group_by(interact_id, date, city_id) %>% 
+      mutate(
+        total_mvpa_minutes = sum(mvpa_vm3),
+        total_light_pa_minutes = sum(light_vm3)
+        )
+
+sd_pa_table <- sd_data %>%
+                group_by(interact_id, date, city_id) %>%
+                  summarize(
+                    time = mean(minutes_id_date_city, na.rm = TRUE),
+                    wearing = mean(wearing, na.rm = TRUE),
+                    mean_mvpa_sd = mean(total_mvpa_minutes, na.rm = TRUE), 
+                    mean_light_sd = mean(total_light_pa_minutes, na.rm = TRUE), 
+                    na_count = sum(is.na(total_mvpa_minutes)), 
+                    count = n()
+                  )
+sd_pa_table
+
+sd_sum_table <- sd_pa_table %>%
+                group_by(city_id) %>%
+                  summarize(
+                    time = mean(time, na.rm = TRUE), 
+                    wearing = mean(wearing, na.rm = TRUE), 
+                    mean_mvpa_sd = mean(mean_mvpa_sd, na.rm = TRUE), 
+                    mean_light_sd = mean(mean_light_sd, na.rm = TRUE), 
+                    na_count = sum(is.na(time)), 
+                    count = n()
+                  )
+sd_sum_table
+```
+
+### MPVA Minutes Ethica
+
+```{r}
+table(ethica_data$activity_levels)
+
+table(ethica_data$wearing)
+
+### MVPA Minutes
+ethica_data <- ethica_data %>%
+	mutate(mvpa_vm3 = case_when(
+		activity_levels_vm3 == "light" ~ 0,
+		activity_levels_vm3 == "moderate" ~ 1,
+		activity_levels_vm3 == "vigorous" ~ 1
+	))
+
+table(ethica_data$mvpa_vm3)
+
+### Light Minutes
+ethica_data <- ethica_data %>%
+	mutate(light_vm3 = case_when(
+		activity_levels_vm3 == "light" ~ 1,
+		activity_levels_vm3 == "moderate" ~ 0,
+		activity_levels_vm3 == "vigorous" ~ 0
+	))
+
+ethica_data <- ethica_data %>% 
+    group_by(interact_id, date, city_id) %>% 
+      mutate(
+        total_mvpa_minutes = sum(mvpa_vm3),
+        total_light_pa_minutes = sum(light_vm3)
+        )
+
+eth_pa_table <- ethica_data %>%
+                group_by(interact_id, date, city_id) %>%
+                  summarize(
+                    time = mean(minutes_id_date_city, na.rm = TRUE),
+                    wearing = mean(wearing, na.rm = TRUE),
+                    mean_mvpa_sd = mean(total_mvpa_minutes, na.rm = TRUE), 
+                    mean_light_sd = mean(total_light_pa_minutes, na.rm = TRUE), 
+                    na_count = sum(is.na(total_mvpa_minutes)), 
+                    count = n()
+                  )
+eth_pa_table
+
+eth_sum_table <- eth_pa_table %>%
+                group_by(city_id) %>%
+                  summarize(
+                    time = mean(time, na.rm = TRUE), 
+                    wearing = mean(wearing, na.rm = TRUE), 
+                    mean_mvpa_sd = mean(mean_mvpa_sd, na.rm = TRUE), 
+                    mean_light_sd = mean(mean_light_sd, na.rm = TRUE), 
+                    na_count = sum(is.na(time)), 
+                    count = n()
+                  )
+eth_sum_table
+```
+
+### Joining SenseDoc and Ethica
+
+```{r}
+sd_eth <- inner_join(sd_data, ethica_data, by = c("interact_id", "utcdate"))
+
+summary(sd_eth$summary_count.x)
+
+summary(sd_eth$summary_count.y)
+
+cor.test(sd_eth$summary_count.x, sd_eth$summary_count.y)
+```
+
+### Cross tab between VM3 cut points 
+
+```{r}
+table(sd_eth$activity_levels_vm3.x, sd_eth$activity_levels_vm3.y)
+```
+
+### Cross tab between vertial axis cut points 
+
+```{r}
+table(sd_eth$activity_levels.x, sd_eth$activity_levels.y)
+```
+
+### Regressing Sensedoc vertical axis count categories on Ethica data VM3 data
+
+```{r}
+glimpse(sd_eth$activity_levels.x)
+sd_eth$activity_levels.x <- as.factor(sd_eth$activity_levels.x)
+
+sd_eth$activity_levels.x <- relevel(sd_eth$activity_levels.x, ref = 3)   
+
+lm_eth_vm3 <- lm(summary_count.y ~ activity_levels.x, data = sd_eth)
+summary(lm_eth_vm3)
+
+
+
+ggplot(sd_eth, aes(x = summary_count.y, y = summary_count.x, colour = activity_levels.x)) + 
+        geom_point(alpha = 0.2)
+
+```
+
+
+
